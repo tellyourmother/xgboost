@@ -1,8 +1,0 @@
-streamlit
-pandas
-numpy
-nba_api
-scikit-learn
-xgboost
-requests
-urllib3
