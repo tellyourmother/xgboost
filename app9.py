@@ -13,9 +13,11 @@ def get_player_id(player_name):
     for player in player_list:
         if player['full_name'].lower() == player_name.lower():
             return player['id']
+    # If not found, show error and return None
+    st.error(f"❌ Player '{player_name}' not found.")
     return None
 
-# Retrieve team ID
+# Retrieve team ID (optional usage)
 def get_team_id(team_name):
     team_list = teams.get_teams()
     for team in team_list:
@@ -27,7 +29,7 @@ def get_team_id(team_name):
 def get_game_logs(player_name, last_n_games=15, location_filter="All"):
     player_id = get_player_id(player_name)
     if not player_id:
-        st.warning(f"⚠️ Player '{player_name}' not found! Check the name.")
+        # Already showed an error in get_player_id
         return None
 
     gamelog = PlayerGameLog(player_id=player_id)
@@ -43,31 +45,33 @@ def get_game_logs(player_name, last_n_games=15, location_filter="All"):
     elif location_filter == "Away":
         df = df[df["LOCATION"] == "Away"]
 
+    # Return only the most recent N games
     return df.head(last_n_games)
 
 # AI Prediction Model using XGBoost
 def predict_next_game(df):
-    # We need at least two games to use the previous game's stats as features for predicting the next game.
+    # Need at least 2 games to train (one game’s stats to predict the next)
     if df is None or len(df) < 2:
         st.warning("⚠️ Not enough data for prediction.")
         return None
 
-    # Reverse the DataFrame so that it is in chronological order
+    # Reverse the DataFrame so it is in chronological order (oldest to newest)
     df = df[::-1]
+
     # Ensure the stat columns are numeric
     df[['PTS', 'REB', 'AST']] = df[['PTS', 'REB', 'AST']].apply(pd.to_numeric)
 
     predicted_stats = {}
     features = ['PTS', 'REB', 'AST']
     
-    # Create training data where X is the stats of a game and y is the next game's stat
-    # For example, for PTS: we use games 1..n-1 as features and games 2..n as targets.
-    X_train = df[features].iloc[:-1].values  # all but the last game
-    # Use the last game’s stats as the input for prediction
+    # Training data: 
+    # X = stats from games 0..n-2, y = stat from games 1..n-1
+    # The last row (game) is used as input to predict the next game
+    X_train = df[features].iloc[:-1].values
     last_game_stats = df[features].iloc[-1].values.reshape(1, -1)
     
     for stat in ['PTS', 'REB', 'AST']:
-        y_train = df[stat].iloc[1:].values  # target: next game stat
+        y_train = df[stat].iloc[1:].values  # The "next game" stat for each row
         model = XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42)
         model.fit(X_train, y_train)
         predicted_stats[stat] = model.predict(last_game_stats)[0]
@@ -92,35 +96,96 @@ def plot_combined_graphs(df, player_name):
     )
 
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    # Reverse for visual order: most recent at the right
     df = df[::-1]
     df[['PTS', 'REB', 'AST']] = df[['PTS', 'REB', 'AST']].apply(pd.to_numeric)
     df["Game Label"] = df["GAME_DATE"].dt.strftime('%b %d') + " vs " + df["OPPONENT"] + " (" + df["LOCATION"] + ")"
 
-    avg_pts, avg_reb, avg_ast = df["PTS"].mean(), df["REB"].mean(), df["AST"].mean()
+    avg_pts = df["PTS"].mean()
+    avg_reb = df["REB"].mean()
+    avg_ast = df["AST"].mean()
+
     colors_pts = ["#4CAF50" if pts > avg_pts else "#2196F3" for pts in df["PTS"]]
     colors_reb = ["#FFA726" if reb > avg_reb else "#FFEB3B" for reb in df["REB"]]
     colors_ast = ["#AB47BC" if ast > avg_ast else "#9575CD" for ast in df["AST"]]
 
     # Points
-    fig.add_trace(go.Bar(x=df["Game Label"], y=df["PTS"], marker=dict(color=colors_pts)), row=1, col=1)
-    fig.add_hline(y=avg_pts, line_dash="dash", line_color="gray", row=1, col=1, annotation_text=f"Avg PTS: {avg_pts:.1f}")
+    fig.add_trace(
+        go.Bar(
+            x=df["Game Label"], 
+            y=df["PTS"], 
+            marker=dict(color=colors_pts)
+        ), 
+        row=1, col=1
+    )
+    fig.add_hline(
+        y=avg_pts, 
+        line_dash="dash", 
+        line_color="gray", 
+        row=1, col=1, 
+        annotation_text=f"Avg PTS: {avg_pts:.1f}"
+    )
 
     # Rebounds
-    fig.add_trace(go.Bar(x=df["Game Label"], y=df["REB"], marker=dict(color=colors_reb)), row=1, col=2)
-    fig.add_hline(y=avg_reb, line_dash="dash", line_color="gray", row=1, col=2, annotation_text=f"Avg REB: {avg_reb:.1f}")
+    fig.add_trace(
+        go.Bar(
+            x=df["Game Label"], 
+            y=df["REB"], 
+            marker=dict(color=colors_reb)
+        ), 
+        row=1, col=2
+    )
+    fig.add_hline(
+        y=avg_reb, 
+        line_dash="dash", 
+        line_color="gray", 
+        row=1, col=2, 
+        annotation_text=f"Avg REB: {avg_reb:.1f}"
+    )
 
     # Assists
-    fig.add_trace(go.Bar(x=df["Game Label"], y=df["AST"], marker=dict(color=colors_ast)), row=2, col=1)
-    fig.add_hline(y=avg_ast, line_dash="dash", line_color="gray", row=2, col=1, annotation_text=f"Avg AST: {avg_ast:.1f}")
+    fig.add_trace(
+        go.Bar(
+            x=df["Game Label"], 
+            y=df["AST"], 
+            marker=dict(color=colors_ast)
+        ), 
+        row=2, col=1
+    )
+    fig.add_hline(
+        y=avg_ast, 
+        line_dash="dash", 
+        line_color="gray", 
+        row=2, col=1, 
+        annotation_text=f"Avg AST: {avg_ast:.1f}"
+    )
 
-    # PRA (Points + Rebounds + Assists)
+    # PRA
     df["PRA"] = df["PTS"] + df["REB"] + df["AST"]
     avg_pra = df["PRA"].mean()
     colors_pra = ["#FF3D00" if pra > avg_pra else "#FF8A65" for pra in df["PRA"]]
-    fig.add_trace(go.Bar(x=df["Game Label"], y=df["PRA"], marker=dict(color=colors_pra)), row=2, col=2)
-    fig.add_hline(y=avg_pra, line_dash="dash", line_color="gray", row=2, col=2, annotation_text=f"Avg PRA: {avg_pra:.1f}")
+    fig.add_trace(
+        go.Bar(
+            x=df["Game Label"], 
+            y=df["PRA"], 
+            marker=dict(color=colors_pra)
+        ), 
+        row=2, col=2
+    )
+    fig.add_hline(
+        y=avg_pra, 
+        line_dash="dash", 
+        line_color="gray", 
+        row=2, col=2, 
+        annotation_text=f"Avg PRA: {avg_pra:.1f}"
+    )
 
-    fig.update_layout(title_text=f"{player_name} Performance Analysis", template="plotly_dark", height=800, width=1200)
+    fig.update_layout(
+        title_text=f"{player_name} Performance Analysis",
+        template="plotly_dark",
+        height=800,
+        width=1200
+    )
     st.plotly_chart(fig)
 
 # Streamlit UI
@@ -148,9 +213,7 @@ if predicted_stats:
     st.write(f"**📌 Predicted Points:** {predicted_stats['PTS']:.1f}")
     st.write(f"**🏀 Predicted Rebounds:** {predicted_stats['REB']:.1f}")
     st.write(f"**🎯 Predicted Assists:** {predicted_stats['AST']:.1f}")
-    st.write(f"🔥 **Predicted PRA:** {predicted_stats['PTS'] + predicted_stats['REB'] + predicted_stats['AST']:.1f}")
+    st.write(f"🔥 **Predicted PRA:** {(predicted_stats['PTS'] + predicted_stats['REB'] + predicted_stats['AST']):.1f}")
 
 # Plot Graphs
 plot_combined_graphs(df, player_name)
-
-        st.error(f"❌ Player '{player_name}' not found.")
