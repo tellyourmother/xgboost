@@ -1,105 +1,156 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-from nba_api.stats.endpoints import playergamelog
-from nba_api.stats.static import players
-from sklearn.multioutput import MultiOutputRegressor
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from nba_api.stats.endpoints import PlayerGameLog
+from nba_api.stats.static import players, teams
 from xgboost import XGBRegressor
-from sklearn.preprocessing import StandardScaler
-from datetime import datetime
+import numpy as np
 
-# ------------------------------
-# Helper: Get current NBA season
-# ------------------------------
-def get_current_season():
-    today = datetime.today()
-    year = today.year
-    if today.month >= 10:  # NBA season starts in October
-        return f"{year}-{str(year + 1)[-2:]}"
-    else:
-        return f"{year - 1}-{str(year)[-2:]}"
+# Retrieve player ID
+def get_player_id(player_name):
+    player_list = players.get_players()
+    for player in player_list:
+        if player['full_name'].lower() == player_name.lower():
+            return player['id']
+    return None
 
+# Retrieve team ID
+def get_team_id(team_name):
+    team_list = teams.get_teams()
+    for team in team_list:
+        if team['full_name'].lower() == team_name.lower():
+            return team['id']
+    return None
 
-# ------------------------------
-# App Layout
-# ------------------------------
-st.title("🏀 NBA Player Stat Predictor")
-st.markdown("Predict a player's next game stats and compare performance to their season average.")
+# Fetch player game logs
+def get_game_logs(player_name, last_n_games=15, location_filter="All"):
+    player_id = get_player_id(player_name)
+    if not player_id:
+        st.warning(f"⚠️ Player '{player_name}' not found! Check the name.")
+        return None
 
-# Input: Player name
-player_name = st.text_input("Enter the full name of an NBA player (e.g., LeBron James):")
+    gamelog = PlayerGameLog(player_id=player_id)
+    df = gamelog.get_data_frames()[0]
+    
+    # Extract opponent and home/away info
+    df["LOCATION"] = df["MATCHUP"].apply(lambda x: "Home" if " vs. " in x else "Away")
+    df["OPPONENT"] = df["MATCHUP"].apply(lambda x: x.split(" vs. ")[-1] if " vs. " in x else x.split(" @ ")[-1])
 
-# Input: Stat to compare to season average
-stat_to_check = st.selectbox("Stat to compare against season average:", ['PTS', 'REB', 'AST', 'FG_PCT'])
+    # Apply location filter
+    if location_filter == "Home":
+        df = df[df["LOCATION"] == "Home"]
+    elif location_filter == "Away":
+        df = df[df["LOCATION"] == "Away"]
 
-if player_name:
-    # Step 1: Find player
-    nba_players = players.get_players()
-    player_dict = next((p for p in nba_players if p['full_name'].lower() == player_name.lower()), None)
+    return df.head(last_n_games)
 
-    if player_dict:
-        player_id = player_dict['id']
-        season = get_current_season()
-        st.info(f"Fetching data for **{player_name}** in the **{season}** season...")
+# AI Prediction Model using XGBoost
+def predict_next_game(df):
+    # We need at least two games to use the previous game's stats as features for predicting the next game.
+    if df is None or len(df) < 2:
+        st.warning("⚠️ Not enough data for prediction.")
+        return None
 
-        # Step 2: Get game log
-        gamelog = playergamelog.PlayerGameLog(
-            player_id=player_id,
-            season=season,
-            season_type_all_star='Regular Season'
-        )
-        df = gamelog.get_data_frames()[0]
+    # Reverse the DataFrame so that it is in chronological order
+    df = df[::-1]
+    # Ensure the stat columns are numeric
+    df[['PTS', 'REB', 'AST']] = df[['PTS', 'REB', 'AST']].apply(pd.to_numeric)
 
-        if len(df) < 5:
-            st.error("❌ Not enough games this season to build a prediction model.")
-        else:
-            # ✅ Prepare data
-            df = df.sort_values('GAME_DATE').reset_index(drop=True)
+    predicted_stats = {}
+    features = ['PTS', 'REB', 'AST']
+    
+    # Create training data where X is the stats of a game and y is the next game's stat
+    # For example, for PTS: we use games 1..n-1 as features and games 2..n as targets.
+    X_train = df[features].iloc[:-1].values  # all but the last game
+    # Use the last game’s stats as the input for prediction
+    last_game_stats = df[features].iloc[-1].values.reshape(1, -1)
+    
+    for stat in ['PTS', 'REB', 'AST']:
+        y_train = df[stat].iloc[1:].values  # target: next game stat
+        model = XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        predicted_stats[stat] = model.predict(last_game_stats)[0]
 
-            # Features and Targets
-            target_cols = ['PTS', 'REB', 'AST', 'FG_PCT']
-            feature_cols = ['MIN', 'FGA', 'FGM', 'FG3A', 'FG3M', 'FTA', 'FTM',
-                            'OREB', 'DREB', 'STL', 'BLK', 'TOV', 'PF']
+    return predicted_stats
 
-            feature_df = df[feature_cols + target_cols].shift(1).iloc[1:]
-            target_df = df[target_cols].iloc[1:]
+# Visualization
+def plot_combined_graphs(df, player_name):
+    if df is None or df.empty:
+        st.warning("⚠️ No data available for selected filters.")
+        return
 
-            # Scale features
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(feature_df)
-            y = target_df.values
+    fig = make_subplots(
+        rows=2, cols=2, 
+        subplot_titles=[
+            f"🏀 {player_name} - Points (PTS)",
+            f"📊 {player_name} - Rebounds (REB)",
+            f"🎯 {player_name} - Assists (AST)",
+            f"🔥 {player_name} - PRA (Points + Rebounds + Assists)"
+        ],
+        horizontal_spacing=0.12, vertical_spacing=0.15
+    )
 
-            # Train model
-            xgb = XGBRegressor(objective='reg:squarederror', n_estimators=100, max_depth=3)
-            model = MultiOutputRegressor(xgb)
-            model.fit(X_scaled, y)
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df = df[::-1]
+    df[['PTS', 'REB', 'AST']] = df[['PTS', 'REB', 'AST']].apply(pd.to_numeric)
+    df["Game Label"] = df["GAME_DATE"].dt.strftime('%b %d') + " vs " + df["OPPONENT"] + " (" + df["LOCATION"] + ")"
 
-            # Predict next game
-            latest_features = df[feature_cols + target_cols].iloc[-1:].values
-            latest_scaled = scaler.transform(latest_features)
-            prediction = model.predict(latest_scaled)
-            pred_df = pd.DataFrame(prediction, columns=target_cols)
+    avg_pts, avg_reb, avg_ast = df["PTS"].mean(), df["REB"].mean(), df["AST"].mean()
+    colors_pts = ["#4CAF50" if pts > avg_pts else "#2196F3" for pts in df["PTS"]]
+    colors_reb = ["#FFA726" if reb > avg_reb else "#FFEB3B" for reb in df["REB"]]
+    colors_ast = ["#AB47BC" if ast > avg_ast else "#9575CD" for ast in df["AST"]]
 
-            st.subheader("🔮 Predicted Next Game Stats:")
-            st.dataframe(pred_df.round(2), use_container_width=True)
+    # Points
+    fig.add_trace(go.Bar(x=df["Game Label"], y=df["PTS"], marker=dict(color=colors_pts)), row=1, col=1)
+    fig.add_hline(y=avg_pts, line_dash="dash", line_color="gray", row=1, col=1, annotation_text=f"Avg PTS: {avg_pts:.1f}")
 
-            # Last 15 games overview
-            recent_df = df.sort_values("GAME_DATE").tail(15).copy()
+    # Rebounds
+    fig.add_trace(go.Bar(x=df["Game Label"], y=df["REB"], marker=dict(color=colors_reb)), row=1, col=2)
+    fig.add_hline(y=avg_reb, line_dash="dash", line_color="gray", row=1, col=2, annotation_text=f"Avg REB: {avg_reb:.1f}")
 
-            # Compare selected stat to season average
-            season_avg = df[stat_to_check].mean()
-            games_over_avg = df[df[stat_to_check] > season_avg]
-            count_over = len(games_over_avg)
+    # Assists
+    fig.add_trace(go.Bar(x=df["Game Label"], y=df["AST"], marker=dict(color=colors_ast)), row=2, col=1)
+    fig.add_hline(y=avg_ast, line_dash="dash", line_color="gray", row=2, col=1, annotation_text=f"Avg AST: {avg_ast:.1f}")
 
-            st.markdown(f"### 📊 {player_name}'s Performance in Last 15 Games")
-            st.write(f"**Season average {stat_to_check}:** {season_avg:.2f}")
-            st.write(f"**Games above season average:** {count_over} out of {len(df)}")
+    # PRA (Points + Rebounds + Assists)
+    df["PRA"] = df["PTS"] + df["REB"] + df["AST"]
+    avg_pra = df["PRA"].mean()
+    colors_pra = ["#FF3D00" if pra > avg_pra else "#FF8A65" for pra in df["PRA"]]
+    fig.add_trace(go.Bar(x=df["Game Label"], y=df["PRA"], marker=dict(color=colors_pra)), row=2, col=2)
+    fig.add_hline(y=avg_pra, line_dash="dash", line_color="gray", row=2, col=2, annotation_text=f"Avg PRA: {avg_pra:.1f}")
 
-            st.markdown("#### 🗓️ Games Over Season Average:")
-            st.dataframe(games_over_avg[['GAME_DATE', 'MATCHUP', stat_to_check]])
+    fig.update_layout(title_text=f"{player_name} Performance Analysis", template="plotly_dark", height=800, width=1200)
+    st.plotly_chart(fig)
 
-            st.markdown("#### 📋 Full Game Log (Last 15 Games):")
-            st.dataframe(recent_df[['GAME_DATE', 'MATCHUP'] + target_cols].sort_values('GAME_DATE'), use_container_width=True)
+# Streamlit UI
+st.title("🏀 NBA Player Performance Dashboard")
 
-    else:
+# Get player input
+player_name = st.text_input("Enter player name:", "LeBron James")
+
+# Location filter
+location_filter = st.radio("Filter Games:", ["All", "Home", "Away"], index=0)
+
+# Fetch Data
+df = get_game_logs(player_name, last_n_games=15, location_filter=location_filter)
+
+# Show DataFrame
+if df is not None:
+    st.subheader(f"📊 Last 15 {location_filter} Games - {player_name}")
+    st.dataframe(df[['GAME_DATE', 'MATCHUP', 'LOCATION', 'OPPONENT', 'PTS', 'REB', 'AST']])
+
+# Predict next game using XGBoost model
+st.subheader(f"🔮 {player_name}'s Predicted Next Game Performance")
+predicted_stats = predict_next_game(df)
+
+if predicted_stats:
+    st.write(f"**📌 Predicted Points:** {predicted_stats['PTS']:.1f}")
+    st.write(f"**🏀 Predicted Rebounds:** {predicted_stats['REB']:.1f}")
+    st.write(f"**🎯 Predicted Assists:** {predicted_stats['AST']:.1f}")
+    st.write(f"🔥 **Predicted PRA:** {predicted_stats['PTS'] + predicted_stats['REB'] + predicted_stats['AST']:.1f}")
+
+# Plot Graphs
+plot_combined_graphs(df, player_name)
+
         st.error(f"❌ Player '{player_name}' not found.")
